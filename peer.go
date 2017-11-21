@@ -294,6 +294,12 @@ func (p *peer) Start() error {
 // channels returned by the database.
 func (p *peer) loadActiveChannels(chans []*channeldb.OpenChannel) error {
 	for _, dbChan := range chans {
+		// If the channel isn't yet open, then we don't need to process
+		// it any further.
+		if dbChan.IsPending || dbChan.IsBorked {
+			continue
+		}
+
 		lnChan, err := lnwallet.NewLightningChannel(p.server.cc.signer,
 			p.server.cc.chainNotifier, p.server.cc.feeEstimator, dbChan)
 		if err != nil {
@@ -301,6 +307,24 @@ func (p *peer) loadActiveChannels(chans []*channeldb.OpenChannel) error {
 		}
 
 		chanPoint := &dbChan.FundingOutpoint
+
+		// If the channel we read form disk has a nil next revocation
+		// key, then we'll skip loading this channel. We must do this
+		// as it doesn't yet have the needed items required to initiate
+		// a local state transition, or one triggered by forwarding an
+		// HTLC.
+		if lnChan.RemoteNextRevocation() == nil {
+			peerLog.Debugf("Skipping ChannelPoint(%v), lacking "+
+				"next commit point", chanPoint)
+			continue
+		}
+
+		isBreached, err := p.server.breachArbiter.IsBreached(chanPoint)
+		if err != nil {
+			return err
+		} else if isBreached {
+			continue
+		}
 
 		chanID := lnwire.NewChanIDFromOutPoint(chanPoint)
 
