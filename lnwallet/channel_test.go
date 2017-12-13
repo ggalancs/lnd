@@ -10,6 +10,7 @@ import (
 	"reflect"
 	"runtime"
 	"testing"
+	"time"
 
 	"github.com/davecgh/go-spew/spew"
 	"github.com/lightningnetwork/lnd/chainntnfs"
@@ -121,6 +122,7 @@ type mockNotfier struct {
 func (m *mockNotfier) RegisterConfirmationsNtfn(txid *chainhash.Hash, numConfs, heightHint uint32) (*chainntnfs.ConfirmationEvent, error) {
 	return nil, nil
 }
+
 func (m *mockNotfier) RegisterBlockEpochNtfn() (*chainntnfs.BlockEpochEvent, error) {
 	return nil, nil
 }
@@ -132,12 +134,54 @@ func (m *mockNotfier) Start() error {
 func (m *mockNotfier) Stop() error {
 	return nil
 }
+
 func (m *mockNotfier) RegisterSpendNtfn(outpoint *wire.OutPoint, heightHint uint32) (*chainntnfs.SpendEvent, error) {
 	return &chainntnfs.SpendEvent{
 		Spend: make(chan *chainntnfs.SpendDetail),
 		Cancel: func() {
 		},
 	}, nil
+}
+
+type mockSpendNotifier struct {
+	*mockNotfier
+	spendMap map[wire.OutPoint][]chan *chainntnfs.SpendDetail
+}
+
+func makeMockSpendNotifier() *mockSpendNotifier {
+	return &mockSpendNotifier{
+		spendMap: make(map[wire.OutPoint][]chan *chainntnfs.SpendDetail),
+	}
+}
+
+func (m *mockSpendNotifier) RegisterSpendNtfn(outpoint *wire.OutPoint,
+	heightHint uint32) (*chainntnfs.SpendEvent, error) {
+
+	spendChan := make(chan *chainntnfs.SpendDetail, 1)
+	m.spendMap[*outpoint] = append(m.spendMap[*outpoint], spendChan)
+	return &chainntnfs.SpendEvent{
+		Spend: spendChan,
+		Cancel: func() {
+		},
+	}, nil
+}
+
+func (m *mockSpendNotifier) Spend(outpoint *wire.OutPoint, height int32,
+	txn *wire.MsgTx) {
+
+	if spendChans, ok := m.spendMap[*outpoint]; ok {
+		delete(m.spendMap, *outpoint)
+		for _, spendChan := range spendChans {
+			txnHash := txn.TxHash()
+			spendChan <- &chainntnfs.SpendDetail{
+				SpentOutPoint:     outpoint,
+				SpendingHeight:    height,
+				SpendingTx:        txn,
+				SpenderTxHash:     &txnHash,
+				SpenderInputIndex: outpoint.Index,
+			}
+		}
+	}
 }
 
 // initRevocationWindows simulates a new channel being opened within the p2p
@@ -204,9 +248,32 @@ func forceStateTransition(chanA, chanB *LightningChannel) error {
 	return nil
 }
 
+func createSpendableTestChannels(
+	revocationWindow int) (*LightningChannel, *LightningChannel,
+	*mockSpendNotifier, func(), error) {
+
+	notifier := makeMockSpendNotifier()
+	alice, bob, cleanup, err := createTestChannelsWithNotifier(
+		revocationWindow, notifier,
+	)
+
+	return alice, bob, notifier, cleanup, err
+}
+
+func createTestChannels(
+	revocationWindow int) (*LightningChannel, *LightningChannel, func(), error) {
+
+	notifier := &mockNotfier{}
+
+	return createTestChannelsWithNotifier(revocationWindow, notifier)
+}
+
 // createTestChannels creates two test channels funded with 10 BTC, with 5 BTC
 // allocated to each side. Within the channel, Alice is the initiator.
-func createTestChannels(revocationWindow int) (*LightningChannel, *LightningChannel, func(), error) {
+func createTestChannelsWithNotifier(revocationWindow int,
+	notifier chainntnfs.ChainNotifier) (*LightningChannel,
+	*LightningChannel, func(), error) {
+
 	aliceKeyPriv, aliceKeyPub := btcec.PrivKeyFromBytes(btcec.S256(),
 		testWalletPrivKey)
 	bobKeyPriv, bobKeyPub := btcec.PrivKeyFromBytes(btcec.S256(),
@@ -352,8 +419,6 @@ func createTestChannels(revocationWindow int) (*LightningChannel, *LightningChan
 
 	aliceSigner := &mockSigner{aliceKeyPriv}
 	bobSigner := &mockSigner{bobKeyPriv}
-
-	notifier := &mockNotfier{}
 
 	channelAlice, err := NewLightningChannel(aliceSigner, notifier,
 		estimator, aliceChannelState)
@@ -1139,6 +1204,65 @@ func TestForceCloseDustOutput(t *testing.T) {
 	commitTxHash = bobChannel.channelState.LocalCommitment.CommitTx.TxHash()
 	if !bytes.Equal(closeTxHash[:], commitTxHash[:]) {
 		t.Fatalf("bob: incorrect close transaction txid")
+	}
+}
+
+// TestBreachClose checks that the resulting ForceCloseSummary is correct when a
+// peer is ForceClosing the channel. Will check outputs both above and below
+// the dust limit.
+func TestBreachClose(t *testing.T) {
+	t.Parallel()
+
+	// TODO(roasbeef): modify to add some HTLC's before closing?
+
+	// Create a test channel which will be used for the duration of this
+	// unittest. The channel will be funded evenly with Alice having 5 BTC,
+	// and Bob having 5 BTC.
+	aliceChannel, bobChannel, notifier, cleanUp, err :=
+		createSpendableTestChannels(1)
+	if err != nil {
+		t.Fatalf("unable to create test channels: %v", err)
+	}
+	defer cleanUp()
+
+	htlcAmount := lnwire.NewMSatFromSatoshis(20000)
+	htlc, _ := createHTLC(0, htlcAmount)
+	if _, err := aliceChannel.AddHTLC(htlc); err != nil {
+		t.Fatalf("alice unable to add htlc: %v", err)
+	}
+	if _, err := bobChannel.ReceiveHTLC(htlc); err != nil {
+		t.Fatalf("bob unable to recv add htlc: %v", err)
+	}
+	if err := forceStateTransition(aliceChannel, bobChannel); err != nil {
+		t.Fatalf("Can't update the channel state: %v", err)
+	}
+
+	forceCloseSummary, err := bobChannel.ForceClose()
+	if err != nil {
+		t.Fatalf("unable to force close bob's channel: %v", err)
+	}
+
+	if _, err := aliceChannel.AddHTLC(htlc); err != nil {
+		t.Fatalf("alice unable to add htlc: %v", err)
+	}
+	if _, err := bobChannel.ReceiveHTLC(htlc); err != nil {
+		t.Fatalf("bob unable to recv add htlc: %v", err)
+	}
+	if err := forceStateTransition(aliceChannel, bobChannel); err != nil {
+		t.Fatalf("Can't update the channel state: %v", err)
+	}
+
+	chanPoint := aliceChannel.ChanPoint
+	breachTxn := forceCloseSummary.CloseTx
+	notifier.Spend(chanPoint, 100, breachTxn)
+
+	select {
+	case <-aliceChannel.ContractBreach:
+		// success
+	case <-aliceChannel.UnilateralClose:
+		t.Fatalf("expected breach close to be signaled, not unilateral")
+	case <-time.After(5 * time.Second):
+		t.Fatalf("channel did not close")
 	}
 }
 
